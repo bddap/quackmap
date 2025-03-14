@@ -1,0 +1,7 @@
+[package]
+name = "quackmap"
+version = "0.1.0"
+edition = "2024"
+description = "A fixed-limit on-disk hashmap with variable-length keys and values."
+
+[dependencies]
