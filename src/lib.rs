@@ -1,39 +1,167 @@
-use std::borrow::{Borrow, BorrowMut};
+use core::mem::size_of;
 
-#[derive(Debug)]
-pub struct InvalidStore;
+/// We store everything in one buffer. The layout is:
+/// [0..8):             u64 num_slots
+/// [8..16):            u64 store_len, serves as bump allocator state
+/// [16..num_slots+16): slots array
+/// [num_slots+16..):   store
+///
+/// The store is bump-allocated storage for linked lists elements. Each element
+/// has this layout:
+/// [0..8):                    u64 next pointer
+/// [8..16):                   u64 payload length
+/// [16..payload_length + 16): payload data
+///
+/// u64s are stored big-endian
+mod stor {
+    use super::*;
 
-pub struct Quack<S, D> {
-    slots: S,
-    store: D,
+    pub const NUM_SLOTS_OFFSET: u64 = 0;
+    pub const STORE_LEN_OFFSET: u64 = size_of::<u64>() as u64;
+    pub const SLOTS_START: u64 = STORE_LEN_OFFSET + size_of::<u64>() as u64;
 
-    // must not be zero, this would cause entries to be written at the beginning of the store, but zero is used to mark empty slots
-    store_len: u64,
-}
+    pub fn read_num_slots(data: &[u8]) -> Result<u64, OutaBounds> {
+        super::read_u64(data, NUM_SLOTS_OFFSET)
+    }
 
-impl<S: Borrow<[u8]>, D: Borrow<[u8]>> Quack<S, D> {
-    pub fn try_read(&self, k: u64) -> Result<Sequence<'_>, InvalidStore> {
-        let slots = self.slots.borrow();
-        let num_slots = slots.len() as u64 / 8;
+    pub fn read_store_len(data: &[u8]) -> Result<u64, OutaBounds> {
+        super::read_u64(data, STORE_LEN_OFFSET)
+    }
 
-        let Some(k) = k.checked_rem(num_slots) else {
-            // map has no space
-            return Ok(Sequence::empty());
-        };
-        let Some(k) = k.checked_mul(8) else {
-            return Ok(Sequence::empty());
-        };
-        let start = read_u64(slots, k)?;
-        Ok(Sequence {
-            store: self.store.borrow(),
-            start,
-        })
+    pub fn write_store_len(data: &mut [u8], store_len: u64) -> Result<(), OutaBounds> {
+        super::write_u64(data, STORE_LEN_OFFSET, store_len)
+    }
+
+    pub fn read_slot(data: &[u8], slot_index: u64) -> Result<u64, OutaBounds> {
+        let slot_offset = slot_index
+            .checked_mul(size_of::<u64>() as u64)
+            .ok_or(OutaBounds)?
+            .checked_add(SLOTS_START)
+            .ok_or(OutaBounds)?;
+        super::read_u64(data, slot_offset)
+    }
+
+    pub fn write_slot(data: &mut [u8], slot_index: u64, value: u64) -> Result<(), OutaBounds> {
+        let slot_offset = slot_index
+            .checked_mul(size_of::<u64>() as u64)
+            .ok_or(OutaBounds)?
+            .checked_add(SLOTS_START)
+            .ok_or(OutaBounds)?;
+        super::write_u64(data, slot_offset, value)
+    }
+
+    pub fn store_start(num_slots: u64) -> Result<u64, OutaBounds> {
+        num_slots
+            .checked_mul(size_of::<u64>() as u64)
+            .and_then(|slots_byte_size| SLOTS_START.checked_add(slots_byte_size))
+            .ok_or(OutaBounds)
     }
 }
 
+/// Values stored in the store. Each is a linked list. Layout:
+/// [0..8):                    u64 next pointer
+/// [8..16):                   u64 payload length
+/// [16..payload_length + 16): payload data
+mod val {
+    use super::*;
+
+    pub const NEXT_POINTER_OFFSET: u64 = 0;
+    pub const PAYLOAD_LEN_OFFSET: u64 = size_of::<u64>() as u64;
+    pub const PAYLOAD_START: u64 = PAYLOAD_LEN_OFFSET + size_of::<u64>() as u64;
+
+    pub fn write(data: &mut [u8], start: u64, next: u64, payload: &[u8]) -> Result<(), OutaBounds> {
+        write_u64(
+            data,
+            val::NEXT_POINTER_OFFSET
+                .checked_add(start)
+                .ok_or(OutaBounds)?,
+            next,
+        )?;
+        write_u64(
+            data,
+            val::PAYLOAD_LEN_OFFSET
+                .checked_add(start)
+                .ok_or(OutaBounds)?,
+            payload.len() as u64,
+        )?;
+        write_range(
+            data,
+            val::PAYLOAD_START.checked_add(start).ok_or(OutaBounds)?,
+            payload,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct OutaBounds;
+
+pub struct Quack<B> {
+    /// Single buffer holding num_slots, store_len, the slots array, and store data.
+    data: B,
+}
+
+impl<B> Quack<B> {
+    pub fn new(data: B) -> Self {
+        Quack { data }
+    }
+}
+
+impl<B: AsRef<[u8]>> Quack<B> {
+    pub fn read(&self, k: u64) -> Result<Sequence<'_>, OutaBounds> {
+        let data = self.data.as_ref();
+
+        let num_slots = stor::read_num_slots(data)?;
+
+        let Some(slot_index) = k.checked_rem(num_slots) else {
+            return Ok(Sequence::empty());
+        };
+
+        let head = stor::read_slot(data, slot_index)?;
+
+        Ok(Sequence { data, next: head })
+    }
+}
+
+impl<B: AsMut<[u8]>> Quack<B> {
+    /// Writes an item for a given key by prepending it to the linked list in that slot.
+    pub fn write(&mut self, k: u64, v: &[u8]) -> Result<(), OutaBounds> {
+        let data = self.data.as_mut();
+
+        let num_slots = stor::read_num_slots(data)?;
+        let store_len = stor::read_store_len(data)?;
+
+        let slot_index = k.checked_rem(num_slots).ok_or(OutaBounds)?;
+
+        let new_len = (size_of::<u64>() as u64 * 2)
+            .checked_add(v.len() as u64)
+            .ok_or(OutaBounds)?
+            .checked_add(store_len)
+            .ok_or(OutaBounds)?;
+
+        let store_start = stor::store_start(num_slots)?;
+
+        let required_data_size = store_start.checked_add(new_len).ok_or(OutaBounds)?;
+
+        if required_data_size > data.len() as u64 {
+            return Err(OutaBounds);
+        }
+
+        let old_head = stor::read_slot(data, slot_index)?;
+        let new_head = store_len.checked_add(store_start).ok_or(OutaBounds)?;
+        val::write(data, new_head, old_head, v)?;
+        stor::write_slot(data, slot_index, new_head)?;
+        stor::write_store_len(data, new_len)?;
+
+        Ok(())
+    }
+}
+
+/// An iterator over values stored in the Quack.
+/// Essentially a view of a linked list.
 pub struct Sequence<'a> {
-    store: &'a [u8],
-    start: u64,
+    data: &'a [u8],
+    next: u64,
 }
 
 impl<'a> Iterator for Sequence<'a> {
@@ -46,205 +174,127 @@ impl<'a> Iterator for Sequence<'a> {
 
 impl<'a> Sequence<'a> {
     fn empty() -> Self {
-        Sequence {
-            store: &[],
-            start: 0,
-        }
+        Sequence { data: &[], next: 0 }
     }
 
-    /// Get the next value in the sequence but return Error if the data is invalid.
-    pub fn try_next(&mut self) -> Result<Option<&'a [u8]>, InvalidStore> {
-        if self.start == 0 {
+    /// Return the next element in this linked list (if any),
+    /// or an error if the data is out of bounds or corrupt.
+    pub fn try_next(&mut self) -> Result<Option<&'a [u8]>, OutaBounds> {
+        if self.next == 0 {
             return Ok(None);
         }
-        let next_start = read_u64(self.store, self.start)?;
-        let payload_len = read_u64(self.store, self.start.checked_add(8).ok_or(InvalidStore)?)?; // todo: variable length encode
+        let next_start = read_u64(
+            self.data,
+            val::NEXT_POINTER_OFFSET
+                .checked_add(self.next)
+                .ok_or(OutaBounds)?,
+        )?;
+        let payload_len = read_u64(
+            self.data,
+            val::PAYLOAD_LEN_OFFSET
+                .checked_add(self.next)
+                .ok_or(OutaBounds)?,
+        )?;
         let ret = get_range_dynamic(
-            self.store,
-            self.start.checked_add(16).ok_or(InvalidStore)?,
+            self.data,
+            val::PAYLOAD_START
+                .checked_add(self.next)
+                .ok_or(OutaBounds)?,
             payload_len,
         )?;
-        self.start = next_start;
+        self.next = next_start;
         Ok(Some(ret))
     }
 }
 
-fn get_range<const N: usize>(store: &[u8], start: u64) -> Result<&[u8; N], InvalidStore> {
-    let start: usize = start.try_into().map_err(|_| InvalidStore)?;
-    let end = start.checked_add(N).ok_or(InvalidStore)?;
-    let ret = store
-        .get(start..end)
-        .ok_or(InvalidStore)?
-        .try_into()
-        .unwrap(); // we know the slice is exactly N bytes
-    Ok(ret)
+fn get_range<const N: usize>(data: &[u8], start: u64) -> Result<&[u8; N], OutaBounds> {
+    let start = start as usize;
+    let end = start.checked_add(N).ok_or(OutaBounds)?;
+    let slice = data.get(start..end).ok_or(OutaBounds)?;
+    Ok(slice.try_into().expect("slice has length N"))
 }
 
-fn get_range_dynamic(store: &[u8], start: u64, len: u64) -> Result<&[u8], InvalidStore> {
-    let start: usize = start.try_into().map_err(|_| InvalidStore)?;
-    let end = start
-        .checked_add(len.try_into().map_err(|_| InvalidStore)?)
-        .ok_or(InvalidStore)?;
-    store.get(start..end).ok_or(InvalidStore)
+fn get_range_dynamic(data: &[u8], start: u64, len: u64) -> Result<&[u8], OutaBounds> {
+    let start = start as usize;
+    let len = len as usize;
+    let end = start.checked_add(len).ok_or(OutaBounds)?;
+    data.get(start..end).ok_or(OutaBounds)
 }
 
-fn read_u64(store: &[u8], start: u64) -> Result<u64, InvalidStore> {
-    Ok(u64::from_be_bytes(*get_range(store, start)?))
+fn read_u64(data: &[u8], start: u64) -> Result<u64, OutaBounds> {
+    let raw = get_range::<8>(data, start)?;
+    Ok(u64::from_be_bytes(*raw))
 }
 
-fn write_u64(store: &mut [u8], start: u64, value: u64) -> Result<(), WriteError> {
-    let start: usize = start.try_into().map_err(|_| WriteError)?;
+fn write_u64(data: &mut [u8], start: u64, value: u64) -> Result<(), OutaBounds> {
+    let start = start as usize;
+    let end = start.checked_add(8).ok_or(OutaBounds)?;
     let bytes = value.to_be_bytes();
-    let end = start.checked_add(8).ok_or(WriteError)?;
-    store
-        .get_mut(start..end)
-        .ok_or(WriteError)?
-        .copy_from_slice(&bytes);
+    let slice = data.get_mut(start..end).ok_or(OutaBounds)?;
+    slice.copy_from_slice(&bytes);
     Ok(())
 }
 
-fn write_range(store: &mut [u8], start: u64, data: &[u8]) -> Result<(), WriteError> {
-    let start: usize = start.try_into().map_err(|_| WriteError)?;
-    let end = start.checked_add(data.len()).ok_or(WriteError)?;
-    store
-        .get_mut(start..end)
-        .ok_or(WriteError)?
-        .copy_from_slice(data);
-    Ok(())
-}
-
-#[derive(Debug)]
-pub struct WriteError;
-
-impl From<InvalidStore> for WriteError {
-    fn from(_: InvalidStore) -> Self {
-        WriteError
-    }
-}
-
-impl<S: BorrowMut<[u8]>, D: BorrowMut<[u8]>> Quack<S, D> {
-    pub fn write(&mut self, k: u64, v: &[u8]) -> Result<(), WriteError> {
-        let slots = self.slots.borrow_mut();
-        let store = self.store.borrow_mut();
-
-        let num_slots = slots.len() as u64 / 8;
-
-        let Some(k) = k.checked_rem(num_slots) else {
-            // map has no space
-            return Err(WriteError);
-        };
-        let Some(k) = k.checked_mul(8) else {
-            return Err(WriteError);
-        };
-
-        // we are going to at least 16 + v.len() bytes in store
-        let new_len = self
-            .store_len
-            .checked_add(v.len() as u64)
-            .ok_or(WriteError)?
-            .checked_add(16)
-            .ok_or(WriteError)?;
-        if new_len > store.len() as u64 {
-            return Err(WriteError);
-        }
-
-        // insert at the head of the linked list
-        let target = read_u64(slots, k)?;
-        write_u64(slots, k, self.store_len)?;
-        write_payload(store, target, self.store_len, v)?;
-
-        self.store_len = new_len;
-
-        Ok(())
-    }
-}
-
-/// save a payload to the store at the given location
-/// payload will be preceded by
-/// - a u64 for the next pointer
-/// - a u64 for the length of the payload
-fn write_payload(
-    store: &mut [u8],
-    next: u64,
-    start: u64,
-    payload: &[u8],
-) -> Result<(), WriteError> {
-    write_u64(store, start, next)?; // next pointer
-    write_u64(
-        store,
-        start.checked_add(8).ok_or(WriteError)?,
-        payload.len() as u64,
-    )?;
-    let payload_start = start.checked_add(16).ok_or(WriteError)?;
-    write_range(store, payload_start, payload)?;
-
+fn write_range(data: &mut [u8], start: u64, buf: &[u8]) -> Result<(), OutaBounds> {
+    let start = start as usize;
+    let end = start.checked_add(buf.len()).ok_or(OutaBounds)?;
+    let slice = data.get_mut(start..end).ok_or(OutaBounds)?;
+    slice.copy_from_slice(buf);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use stor::write_store_len;
+
     use super::*;
+
+    fn write_num_slots(data: &mut [u8], num_slots: u64) -> Result<(), OutaBounds> {
+        super::write_u64(data, stor::NUM_SLOTS_OFFSET, num_slots)
+    }
 
     #[test]
     fn single_key() {
-        let slots = [0u8; 32];
-        let store = [0u8; 64];
-        let mut quack = Quack {
-            slots,
-            store,
-            store_len: 1,
-        };
+        let mut buf = [0u8; 112];
+        write_num_slots(&mut buf, 4).unwrap();
+        write_store_len(&mut buf, 0).unwrap();
 
-        println!("Initial state: {:?}", slots);
-        println!("Initial store: {:?}", store);
+        let mut quack = Quack::new(buf);
 
         quack.write(0, b"hello").unwrap();
-
-        println!("After first write: {:?}", quack.slots);
-        println!("After first write: {:?}", quack.store);
-
         quack.write(0, b"world").unwrap();
 
-        println!("After writes: {:?}", quack.slots);
-        println!("After writes: {:?}", quack.store);
-
-        assert_eq!(
-            quack.try_read(0).unwrap().collect::<Vec<_>>(),
-            [b"world", b"hello"]
-        );
+        let items = quack.read(0).unwrap().collect::<Vec<_>>();
+        assert_eq!(&items[..], &[b"world", b"hello"]);
     }
 
     #[test]
     fn multiple_keys() {
-        let slots = [0u8; 32];
-        let store = [0u8; 128];
-        let mut quack = Quack {
-            slots,
-            store,
-            store_len: 1,
-        };
+        let mut buf = [0u8; 128];
+        write_num_slots(&mut buf, 4).unwrap();
+        write_store_len(&mut buf, 0).unwrap();
 
+        let mut quack = Quack::new(buf);
         quack.write(0, b"hello").unwrap();
         quack.write(1, b"world").unwrap();
         quack.write(2, b"quack").unwrap();
 
-        assert_eq!(quack.try_read(0).unwrap().collect::<Vec<_>>(), [b"hello"]);
-        assert_eq!(quack.try_read(1).unwrap().collect::<Vec<_>>(), [b"world"]);
-        assert_eq!(quack.try_read(2).unwrap().collect::<Vec<_>>(), [b"quack"]);
+        assert_eq!(&quack.read(0).unwrap().collect::<Vec<_>>(), &[b"hello"]);
+        assert_eq!(&quack.read(1).unwrap().collect::<Vec<_>>(), &[b"world"]);
+        assert_eq!(&quack.read(2).unwrap().collect::<Vec<_>>(), &[b"quack"]);
     }
 
     #[test]
     fn miss() {
-        let slots = [0u8; 32];
-        let store = [0u8; 64];
-        let mut quack = Quack {
-            slots,
-            store,
-            store_len: 1,
-        };
+        let mut buf = [0u8; 69];
+        write_num_slots(&mut buf, 4).unwrap();
+        write_store_len(&mut buf, 0).unwrap();
 
+        let mut quack = Quack::new(&mut buf);
+
+        println!("quack: {:?}", quack.data);
         quack.write(0, b"hello").unwrap();
 
-        assert!(quack.try_read(1).unwrap().next().is_none());
+        assert!(quack.read(1).unwrap().next().is_none());
     }
 }
