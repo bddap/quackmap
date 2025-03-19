@@ -1,4 +1,7 @@
-use core::{fmt::{self, Display, Formatter}, mem::size_of};
+use core::{
+    fmt::{self, Display, Formatter},
+    mem::size_of,
+};
 use std::fmt::Debug;
 
 /// We store everything in one buffer. The layout is:
@@ -136,6 +139,14 @@ impl<B> Quack<B> {
     pub fn new(data: B) -> Self {
         Quack { data }
     }
+
+    pub fn into_inner(self) -> B {
+        self.data
+    }
+
+    pub fn ref_inner(&self) -> &B {
+        &self.data
+    }
 }
 
 impl<B: AsRef<[u8]>> Quack<B> {
@@ -151,6 +162,10 @@ impl<B: AsRef<[u8]>> Quack<B> {
         let head = stor::read_slot(data, slot_index)?;
 
         Ok(Sequence { data, next: head })
+    }
+
+    pub fn slots(&self) -> Result<u64, OutaBounds> {
+        stor::read_num_slots(self.data.as_ref())
     }
 }
 

@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
+use memmap2::MmapMut;
 use quackmap::Quack;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -28,6 +29,11 @@ struct Args {
     /// Size in bytes of randomly generated values.
     #[arg(long, default_value_t = 32)]
     value_size: usize,
+
+    /// After initial build, run a second pass to optimize reads. The resulting quack will have values with the same key
+    /// stored adjacent to eachother in memory.
+    #[arg(long)]
+    optimize: bool,
 }
 
 impl Args {
@@ -56,12 +62,19 @@ fn size_needed(entries: usize, slots: usize, value_size: usize) -> Result<usize>
     })
 }
 
+fn create_mmaped_mut_quack(slots: usize, size_bytes: usize) -> Result<Quack<MmapMut>> {
+    let mmap = MmapMut::map_anon(size_bytes)?;
+    let quack = Quack::initialize_assume_zeroed(mmap, slots.try_into()?)?;
+    Ok(quack)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let size_needed = size_needed(args.entries, args.slots(), args.value_size)?;
 
-    let mut mmap = memmap2::MmapMut::map_anon(size_needed)?;
-    let mut quack = Quack::initialize_assume_zeroed(&mut mmap, args.slots().try_into()?)?;
+    // let mmap = MmapMut::map_anon(size_needed)?;
+    // let mut quack = Quack::initialize_assume_zeroed(mmap, args.slots().try_into()?)?;
+    let mut quack = create_mmaped_mut_quack(args.slots(), size_needed)?;
 
     let mut rng = Xoshiro256PlusPlus::from_seed(rand::random());
     let mut value = vec![0u8; args.value_size];
@@ -83,7 +96,13 @@ fn main() -> Result<()> {
         eprintln!("Time per write: {:?}", time_per_read);
     }
 
-    let (res, elapsed) = time(|| std::io::stdout().write_all(&mmap));
+    if args.optimize {
+        let (res, elapsed) = time(|| optimize(&quack));
+        quack = res?;
+        eprintln!("Optimized the quack in {:?}", elapsed);
+    }
+
+    let (res, elapsed) = time(|| std::io::stdout().write_all(&quack.into_inner()));
     res?;
     if let Some(time_per_write) = per(elapsed, 1) {
         eprintln!("Time to write to output: {:?}", time_per_write);
@@ -106,4 +125,27 @@ fn per(d: Duration, n: usize) -> Option<Duration> {
         .try_into()
         .ok()?;
     Some(Duration::from_nanos(nanos))
+}
+
+fn optimize(quack: &Quack<MmapMut>) -> Result<Quack<MmapMut>> {
+    let size = quack.ref_inner().len();
+    let num_slots = quack.slots()?;
+    let mut optimized_quack = create_mmaped_mut_quack(num_slots.try_into()?, size)?;
+    for slot in 0..num_slots {
+        for entry in quack.read(slot)? {
+            optimized_quack.write(slot, entry)?;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        for slot in 0..num_slots {
+            let inps = Vec::<&[u8]>::from_iter(quack.read(slot)?);
+            let mut outps = Vec::<&[u8]>::from_iter(optimized_quack.read(slot)?);
+            outps.reverse();
+            assert_eq!(inps, outps, "slot {} does not match", slot);
+        }
+    }
+
+    Ok(optimized_quack)
 }
