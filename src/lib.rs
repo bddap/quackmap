@@ -32,6 +32,10 @@ mod stor {
         super::write_u64(data, STORE_LEN_OFFSET, store_len)
     }
 
+    pub fn write_num_slots(data: &mut [u8], num_slots: u64) -> Result<(), OutaBounds> {
+        super::write_u64(data, NUM_SLOTS_OFFSET, num_slots)
+    }
+
     pub fn read_slot(data: &[u8], slot_index: u64) -> Result<u64, OutaBounds> {
         let slot_offset = slot_index
             .checked_mul(size_of::<u64>() as u64)
@@ -93,6 +97,22 @@ mod val {
     }
 }
 
+/// Calculate the required buffer size for the backing store
+/// given a number of slots and the sizes of the values to be written.
+/// Assumes each value will be written with 16 bytes of overhead.
+pub fn calculate_store_size<T>(slot_count: u64, value_sizes: T) -> Result<u64, OutaBounds>
+where
+    T: IntoIterator<Item = u64>,
+{
+    value_sizes
+        .into_iter()
+        .try_fold(stor::store_start(slot_count)?, |acc, size| {
+            // Each value has 16 bytes overhead (next pointer + len)
+            acc.checked_add(val::PAYLOAD_START).ok_or(OutaBounds)?
+              .checked_add(size).ok_or(OutaBounds)
+        })
+}
+
 #[derive(Debug)]
 pub struct OutaBounds;
 
@@ -124,6 +144,21 @@ impl<B: AsRef<[u8]>> Quack<B> {
 }
 
 impl<B: AsMut<[u8]>> Quack<B> {
+    /// Initializes the Quack with a given number of slots
+    /// the data store provided must be all zeroes.
+    pub fn initialize_assume_zeroed(
+        mut data: B,
+        num_slots: u64,
+    ) -> Result<Self, OutaBounds> {
+        let dat = data.as_mut();
+        if dat.len() < stor::store_start(num_slots)? as usize {
+            return Err(OutaBounds);
+        }
+        stor::write_store_len(dat, 0)?;
+        stor::write_num_slots(dat, num_slots)?;
+        Ok(Quack { data })
+    }
+
     /// Writes an item for a given key by prepending it to the linked list in that slot.
     pub fn write(&mut self, k: u64, v: &[u8]) -> Result<(), OutaBounds> {
         let data = self.data.as_mut();
@@ -246,12 +281,9 @@ fn write_range(data: &mut [u8], start: u64, buf: &[u8]) -> Result<(), OutaBounds
 #[cfg(test)]
 mod tests {
     use stor::write_store_len;
+    use stor::write_num_slots;
 
     use super::*;
-
-    fn write_num_slots(data: &mut [u8], num_slots: u64) -> Result<(), OutaBounds> {
-        super::write_u64(data, stor::NUM_SLOTS_OFFSET, num_slots)
-    }
 
     #[test]
     fn single_key() {
