@@ -1,4 +1,5 @@
-use core::mem::size_of;
+use core::{fmt::{self, Display, Formatter}, mem::size_of};
+use std::fmt::Debug;
 
 /// We store everything in one buffer. The layout is:
 /// [0..8):             u64 num_slots
@@ -108,13 +109,23 @@ where
         .into_iter()
         .try_fold(stor::store_start(slot_count)?, |acc, size| {
             // Each value has 16 bytes overhead (next pointer + len)
-            acc.checked_add(val::PAYLOAD_START).ok_or(OutaBounds)?
-              .checked_add(size).ok_or(OutaBounds)
+            acc.checked_add(val::PAYLOAD_START)
+                .ok_or(OutaBounds)?
+                .checked_add(size)
+                .ok_or(OutaBounds)
         })
 }
 
 #[derive(Debug)]
 pub struct OutaBounds;
+
+impl Display for OutaBounds {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Debug::fmt(self, f)
+    }
+}
+
+impl core::error::Error for OutaBounds {}
 
 pub struct Quack<B> {
     /// Single buffer holding num_slots, store_len, the slots array, and store data.
@@ -146,10 +157,7 @@ impl<B: AsRef<[u8]>> Quack<B> {
 impl<B: AsMut<[u8]>> Quack<B> {
     /// Initializes the Quack with a given number of slots
     /// the data store provided must be all zeroes.
-    pub fn initialize_assume_zeroed(
-        mut data: B,
-        num_slots: u64,
-    ) -> Result<Self, OutaBounds> {
+    pub fn initialize_assume_zeroed(mut data: B, num_slots: u64) -> Result<Self, OutaBounds> {
         let dat = data.as_mut();
         if dat.len() < stor::store_start(num_slots)? as usize {
             return Err(OutaBounds);
@@ -280,8 +288,8 @@ fn write_range(data: &mut [u8], start: u64, buf: &[u8]) -> Result<(), OutaBounds
 
 #[cfg(test)]
 mod tests {
-    use stor::write_store_len;
     use stor::write_num_slots;
+    use stor::write_store_len;
 
     use super::*;
 
